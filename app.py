@@ -1,5 +1,5 @@
 import streamlit as st
-import ccxt
+import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -7,60 +7,51 @@ from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Crypto Smart Bot", page_icon="🤖", layout="wide")
 
-st.title("🤖 스마트 트레이딩 대시보드 (Bybit/Binance Auto-routing)")
+st.title("🤖 스마트 트레이딩 대시보드 (TradingView 데이터 연동)")
 st.markdown("---")
 
-def get_working_exchange():
-    """바이비트 차단 시 바이낸스로 우회하는 거래소 객체 생성기"""
-    exchange = ccxt.bybit()
-    exchange.set_sandbox_mode(True) # 바이비트 테스트넷 활성화 (IP 차단 회피 시도)
-    return exchange
+# 종목 심볼 매핑 (바이비트 이름 -> 글로벌 데이터 이름)
+TICKERS = {
+    'BTC/USDT': 'BTC-USD', 
+    'ETH/USDT': 'ETH-USD', 
+    'XRP/USDT': 'XRP-USD', 
+    'SOL/USDT': 'SOL-USD'
+}
 
 @st.cache_data(ttl=60) 
 def get_market_data():
-    exchange = get_working_exchange()
-    tickers = ['BTC/USDT', 'ETH/USDT', 'XRP/USDT', 'SOL/USDT']
     data = []
-    
-    # 1. 바이비트 테스트넷으로 시도
-    try:
-        for ticker in tickers:
-            ticker_data = exchange.fetch_ticker(ticker)
-            data.append({"종목": ticker, "24H 거래대금(USDT)": ticker_data['quoteVolume']})
-        market_source = "Bybit (Testnet)"
-    except Exception as e:
-        # 2. 실패 시 바이낸스로 자동 우회 (시세 데이터 전용)
-        st.warning("⚠️ 바이비트 서버 접속 제한됨. 분석용 데이터를 바이낸스에서 우회하여 가져옵니다.")
-        exchange = ccxt.binance()
-        data = []
-        for ticker in tickers:
-            try:
-                ticker_data = exchange.fetch_ticker(ticker)
-                data.append({"종목": ticker, "24H 거래대금(USDT)": ticker_data['quoteVolume']})
-            except:
-                continue
-        market_source = "Binance (Fallback)"
-
-    # 데이터가 아예 없을 경우 에러 방지 (KeyError 해결)
+    for bybit_ticker, yf_ticker in TICKERS.items():
+        try:
+            ticker = yf.Ticker(yf_ticker)
+            # 오늘 하루치 데이터만 가져오기
+            hist = ticker.history(period="1d")
+            if not hist.empty:
+                # 글로벌 데이터는 코인 갯수 기준이므로 가격을 곱해 거래대금(USDT)으로 변환
+                quote_vol = hist['Volume'].iloc[-1] * hist['Close'].iloc[-1]
+                data.append({"종목": bybit_ticker, "24H 거래대금(USDT)": quote_vol})
+        except Exception as e:
+            st.error(f"🚨 {bybit_ticker} 데이터 오류: {e}")
+            continue
+            
     if not data:
-        st.error("🚨 모든 거래소에서 데이터를 불러오지 못했습니다.")
-        return pd.DataFrame(columns=["종목", "24H 거래대금(USDT)"]), "Error"
+        return pd.DataFrame(columns=["종목", "24H 거래대금(USDT)"])
         
     df = pd.DataFrame(data).sort_values(by="24H 거래대금(USDT)", ascending=False).reset_index(drop=True)
-    return df, market_source
+    return df
 
 @st.cache_data(ttl=60)
 def fetch_ohlcv(symbol, timeframe='15m', limit=100):
-    exchange = get_working_exchange()
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-    except:
-        # 바이비트 실패 시 바이낸스 차트 데이터로 우회
-        exchange = ccxt.binance()
-        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-        
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    yf_ticker = TICKERS[symbol]
+    ticker = yf.Ticker(yf_ticker)
+    
+    # yfinance는 기간(period)을 설정해야 분봉을 가져올 수 있음
+    period = "5d" if timeframe in ["5m", "15m"] else "1mo"
+    df = ticker.history(period=period, interval=timeframe)
+    
+    df = df.tail(limit).reset_index()
+    # 열 이름을 이전 코드와 똑같이 맞춤
+    df = df.rename(columns={'Datetime': 'timestamp', 'Date': 'timestamp', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
     return df
 
 def draw_chart(df, symbol):
@@ -86,17 +77,17 @@ def draw_chart(df, symbol):
 
 # --- 사이드바 & 메인 UI ---
 st.sidebar.header("⚙️ 봇 컨트롤 패널")
-timeframe = st.sidebar.selectbox("타임프레임 선택", ["5m", "15m", "1h", "4h", "1d"], index=1)
+timeframe = st.sidebar.selectbox("타임프레임 선택", ["5m", "15m", "1h", "1d"], index=1)
 
 if st.sidebar.button("🔍 시장 분석 및 차트 불러오기"):
-    with st.spinner("데이터를 분석 중입니다..."):
-        df_market, source = get_market_data()
+    with st.spinner("트레이딩뷰 데이터를 분석 중입니다..."):
+        df_market = get_market_data()
         
-        if source != "Error" and not df_market.empty:
+        if not df_market.empty:
             target_symbol = df_market.iloc[0]["종목"]
             target_vol = df_market.iloc[0]["24H 거래대금(USDT)"]
             
-            st.success(f"🔥 현재 거래대금 1위 주도주: **{target_symbol}** ($ {target_vol:,.0f}) | 데이터 출처: {source}")
+            st.success(f"🔥 현재 거래대금 1위 주도주: **{target_symbol}** ($ {target_vol:,.0f})")
             
             col1, col2 = st.columns([1, 3])
             with col1:
