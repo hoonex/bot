@@ -15,12 +15,10 @@ st.markdown("---")
 if 'balance' not in st.session_state: st.session_state['balance'] = 10000.0
 if 'position' not in st.session_state: st.session_state['position'] = None
 if 'history' not in st.session_state: st.session_state['history'] = []
-# 화면이 리셋되지 않도록 '분석 모드' 켜짐 상태를 기억하는 변수 추가
 if 'dashboard_active' not in st.session_state: st.session_state['dashboard_active'] = False
 
 TICKERS = {'BTC/USDT': 'BTC-USD', 'ETH/USDT': 'ETH-USD', 'XRP/USDT': 'XRP-USD', 'SOL/USDT': 'SOL-USD'}
 
-# ttl=10으로 줄여서 10초마다 최신 실시간 데이터를 가져오도록 세팅
 @st.cache_data(ttl=10) 
 def get_market_data():
     data = []
@@ -38,12 +36,9 @@ def get_market_data():
 @st.cache_data(ttl=10)
 def fetch_ohlcv(symbol, timeframe='1m', limit=100):
     yf_ticker = TICKERS[symbol]
-    
-    # 1분봉은 yfinance에서 최근 7일치까지만 지원함
     if timeframe == '1m': period = "5d"
     elif timeframe in ['5m', '15m']: period = "1mo"
     else: period = "1mo"
-        
     df = yf.Ticker(yf_ticker).history(period=period, interval=timeframe).tail(limit).reset_index()
     df = df.rename(columns={'Datetime': 'timestamp', 'Date': 'timestamp', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
     return df
@@ -78,9 +73,8 @@ def analyze_strategy(df, weights):
 
 # --- 사이드바 ---
 st.sidebar.header("⚙️ 봇 컨트롤 패널")
-# 1분봉(1m) 추가
 timeframe = st.sidebar.selectbox("타임프레임 선택", ["1m", "5m", "15m", "1h", "4h", "1d"], index=0)
-entry_threshold = st.sidebar.number_input("🚨 매수 진입 기준 점수", min_value=10, max_value=100, value=70)
+entry_threshold = st.sidebar.number_input("🚨 진입 기준 점수", min_value=10, max_value=100, value=70)
 
 weights = {
     'ob': st.sidebar.slider("오더블럭 비중", 0, 100, 40, 5),
@@ -89,22 +83,22 @@ weights = {
     'pattern': st.sidebar.slider("패턴 비중", 0, 100, 10, 5)
 }
 
-# 분석 버튼을 누르면 상태를 True로 변경
 if st.sidebar.button("🔍 시장 분석 시작 / 새로고침"):
     st.session_state['dashboard_active'] = True
 
 # --- 메인 대시보드 UI ---
 col_bal, col_pos = st.columns(2)
 col_bal.metric(label="💰 내 가상 지갑 잔고", value=f"$ {st.session_state['balance']:,.2f}")
+
+# 보유 포지션이 롱인지 숏인지 표시
 if st.session_state['position']:
     pos = st.session_state['position']
-    col_pos.metric(label="📈 현재 보유 포지션", value=f"{pos['symbol']} (진입가: $ {pos['entry_price']:,.2f})")
+    col_pos.metric(label=f"📈 현재 보유 포지션 ({pos['type']})", value=f"{pos['symbol']} (진입가: $ {pos['entry_price']:,.2f})")
 else:
     col_pos.metric(label="📈 현재 보유 포지션", value="없음 (관망 중)")
 
 st.markdown("---")
 
-# 대시보드가 켜져 있을 때만 아래 내용을 그림 (매수/매도 버튼을 눌러도 여기가 계속 실행됨)
 if st.session_state['dashboard_active']:
     df_market = get_market_data()
     
@@ -115,45 +109,70 @@ if st.session_state['dashboard_active']:
         total_score, matched_reasons = analyze_strategy(df_ohlcv, weights)
         
         st.subheader(f"🔥 타겟 종목: {target_symbol} (현재가: $ {current_price:,.2f})")
-        st.write(f"**전략 총점: {total_score}점** / 100점")
-        for r in matched_reasons: st.caption(r)
         
-        col1, col2 = st.columns([1, 2])
+        # 화면을 3개로 나눔: [점수 분석] [매매 조종석] [차트]
+        col_score, col_action, col_chart = st.columns([1, 1, 2])
         
-        with col1:
-            # 매수/매도 버튼 로직
-            if total_score >= entry_threshold and st.session_state['position'] is None:
-                st.success("🟢 매수 시그널 포착! (모의 진입 가능)")
-                if st.button("🛒 테스트 매수 (Buy)", use_container_width=True):
-                    st.session_state['position'] = {'symbol': target_symbol, 'entry_price': current_price}
-                    st.session_state['history'].append({"시간": datetime.now().strftime("%H:%M:%S"), "종목": target_symbol, "구분": "매수", "가격": current_price, "수익금": 0})
-                    st.rerun() # 화면 새로고침해도 dashboard_active가 True라 안 날아감
+        with col_score:
+            st.write(f"**전략 총점: {total_score}점** / 100점")
+            for r in matched_reasons: st.caption(r)
+            if total_score >= entry_threshold:
+                st.success("🟢 진입 시그널 포착!")
+            else:
+                st.info("🟡 기준 점수 미달 (관망)")
+                
+        with col_action:
+            st.write("**🕹️ 매매 조종석**")
+            
+            # 1. 포지션이 없을 때 -> 롱/숏 진입 버튼 표시
+            if st.session_state['position'] is None:
+                if st.button("📈 롱(Buy) 진입", use_container_width=True):
+                    st.session_state['position'] = {'symbol': target_symbol, 'entry_price': current_price, 'type': 'Long'}
+                    st.session_state['history'].append({"시간": datetime.now().strftime("%H:%M:%S"), "종목": target_symbol, "구분": "롱(Buy)", "가격": current_price, "수익금": 0})
+                    st.rerun()
+                
+                if st.button("📉 숏(Sell) 진입", use_container_width=True):
+                    st.session_state['position'] = {'symbol': target_symbol, 'entry_price': current_price, 'type': 'Short'}
+                    st.session_state['history'].append({"시간": datetime.now().strftime("%H:%M:%S"), "종목": target_symbol, "구분": "숏(Sell)", "가격": current_price, "수익금": 0})
+                    st.rerun()
                     
-            elif st.session_state['position'] is not None:
+            # 2. 포지션이 있을 때 -> 수익률 계산 및 '청산' 버튼 표시
+            else:
                 pos = st.session_state['position']
-                profit = current_price - pos['entry_price']
+                
+                # 롱(상승) / 숏(하락)에 따른 수익률 계산 분기
+                if pos['type'] == 'Long':
+                    profit = current_price - pos['entry_price']
+                else:
+                    profit = pos['entry_price'] - current_price
+                    
                 profit_pct = (profit / pos['entry_price']) * 100
                 
-                st.warning(f"🟡 현재 {pos['symbol']} 보유 중 (수익률: {profit_pct:.2f}%)")
-                if st.button("💸 테스트 매도 (Sell & Take Profit)", use_container_width=True):
+                # 수익이면 초록색, 손실이면 빨간색 박스로 표시
+                if profit >= 0:
+                    st.success(f"현재 수익률: +{profit_pct:.2f}% ($ {profit:.2f})")
+                else:
+                    st.error(f"현재 수익률: {profit_pct:.2f}% ($ {profit:.2f})")
+                
+                # 확실하게 눈에 띄는 빨간색 청산 버튼 (type="primary")
+                if st.button("❌ 포지션 청산 (Close)", use_container_width=True, type="primary"):
                     st.session_state['balance'] += profit 
-                    st.session_state['history'].append({"시간": datetime.now().strftime("%H:%M:%S"), "종목": pos['symbol'], "구분": "매도", "가격": current_price, "수익금": round(profit, 2)})
+                    st.session_state['history'].append({"시간": datetime.now().strftime("%H:%M:%S"), "종목": pos['symbol'], "구분": f"{pos['type']} 청산", "가격": current_price, "수익금": round(profit, 2)})
                     st.session_state['position'] = None 
                     st.rerun()
-            else:
-                st.info("조건 미달로 관망 중입니다.")
                 
-        with col2:
+        with col_chart:
             fig = go.Figure(data=[go.Candlestick(x=df_ohlcv['timestamp'], open=df_ohlcv['open'], high=df_ohlcv['high'], low=df_ohlcv['low'], close=df_ohlcv['close'])])
             fig.update_layout(height=400, margin=dict(l=0, r=0, t=0, b=0), xaxis_rangeslider_visible=False)
             st.plotly_chart(fig, use_container_width=True)
 
 else:
-    st.info("👈 왼쪽 사이드바에서 '시장 분석 시작' 버튼을 눌러 봇을 가동해주세요.")
+    st.info("👈 왼쪽 사이드바에서 '시장 분석 시작' 버튼을 눌러주세요.")
 
 st.markdown("---")
 st.subheader("📝 모의투자 매매 일지")
 if st.session_state['history']:
-    st.dataframe(pd.DataFrame(st.session_state['history']).iloc[::-1], use_container_width=True) # 최신 내역이 위로 오게 뒤집기
+    # 최신 기록이 위로 올라오도록 표 순서 뒤집기 (.iloc[::-1])
+    st.dataframe(pd.DataFrame(st.session_state['history']).iloc[::-1], use_container_width=True) 
 else:
     st.write("아직 매매 기록이 없습니다.")
